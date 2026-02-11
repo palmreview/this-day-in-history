@@ -1,12 +1,17 @@
 # This Day in History — Newspapers (Chronicling America via loc.gov)
-# Version: 0.2.0
+# Version: 0.2.1
 # Date: 2026-02-11
 #
-# Fixes vs 0.1.0:
-# - Adds a single-year "Test this year" mode (1 request -> easy debugging)
-# - Adds "Known-good example" button from official docs
-# - Shows HTTP status/errors/snippets when blocked or non-JSON is returned
-# - Safer scanning: decade-step backward search (far fewer requests -> avoids rate limits)
+# Fixes:
+# - Uses certifi CA bundle to avoid SSL CERTIFICATE_VERIFY_FAILED on some environments
+# - Adds "Known-good example query" + single-year test + safer decade-step scan
+# - Shows useful HTTP/HTML error snippets instead of silently failing
+#
+# Requirements:
+#   pip install streamlit certifi
+#
+# Run:
+#   streamlit run app.py
 
 from __future__ import annotations
 
@@ -17,9 +22,11 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+import certifi
+import ssl
 import streamlit as st
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 BASE_COLLECTION_URL = "https://www.loc.gov/collections/chronicling-america/"
 
 
@@ -60,20 +67,30 @@ def build_query_url(
 def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """
     Returns (payload_or_none, debug_info)
-    debug_info includes: ok, status, content_type, error, snippet
+    debug_info includes: ok, status, content_type, error, snippet, url
+    Uses certifi CA bundle for HTTPS verification.
     """
-    debug = {"ok": False, "status": None, "content_type": None, "error": None, "snippet": None, "url": url}
+    debug: Dict[str, Any] = {
+        "ok": False,
+        "status": None,
+        "content_type": None,
+        "error": None,
+        "snippet": None,
+        "url": url,
+    }
 
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "ThisDayInHistoryStreamlit/0.2",
+            "User-Agent": "ThisDayInHistoryStreamlit/0.2.1",
             "Accept": "application/json",
         },
     )
 
+    ctx = ssl.create_default_context(cafile=certifi.where())
+
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
             status = getattr(resp, "status", None)
             content_type = resp.headers.get("Content-Type", "")
             raw = resp.read()
@@ -82,7 +99,7 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
         debug["error"] = f"HTTPError {e.code}: {e.reason}"
         try:
             raw = e.read()
-            debug["snippet"] = raw[:500].decode("utf-8", errors="replace")
+            debug["snippet"] = raw[:600].decode("utf-8", errors="replace")
         except Exception:
             pass
         return None, debug
@@ -93,11 +110,12 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
     debug["status"] = status
     debug["content_type"] = content_type
 
-    # Sometimes blocks return HTML; handle that clearly
     text = raw.decode("utf-8", errors="replace")
+
+    # If blocked or an error page is returned, it may be HTML
     if "json" not in (content_type or "").lower():
         debug["error"] = f"Non-JSON response (Content-Type: {content_type})"
-        debug["snippet"] = text[:500]
+        debug["snippet"] = text[:600]
         return None, debug
 
     try:
@@ -106,7 +124,7 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
         return payload, debug
     except Exception as e:
         debug["error"] = f"JSON parse failed: {e}"
-        debug["snippet"] = text[:500]
+        debug["snippet"] = text[:600]
         return None, debug
 
 
@@ -142,6 +160,7 @@ def item_snippet(item: Dict[str, Any], max_chars: int = 700) -> str:
     if isinstance(txt, str) and txt.strip():
         s = " ".join(txt.split())
         return (s[:max_chars] + "…") if len(s) > max_chars else s
+
     desc = item.get("description")
     if isinstance(desc, list) and desc:
         s = " ".join(str(desc[0]).split())
@@ -188,21 +207,27 @@ def decade_step_most_recent(
 ) -> Tuple[Optional[int], Optional[Dict[str, Any]], str, Dict[str, Any]]:
     """
     Fewer requests than year-by-year:
-    - check 1960s, 1950s, 1940s... by testing the first year of each decade backwards
-    - once a decade hits, walk within that decade (max 10 requests) to find most recent
+    - check decade anchors (1960, 1950, ...)
+    - once a decade hits, walk within that decade for the most recent hit
     """
-    # Use 1963 max (collection temporal coverage commonly ends there)
-    years = list(range(1960, 1689, -10))  # 1960, 1950, ...
-    last_debug = {}
+    years = list(range(1960, 1689, -10))
+    last_debug: Dict[str, Any] = {}
 
     def query_year(y: int):
         date_str = f"{y:04d}-{month:02d}-{day:02d}"
-        url = build_query_url(date_str, date_str, state=state, keyword=keyword, front_pages_only=front_pages_only)
+        url = build_query_url(
+            date_str,
+            date_str,
+            state=state,
+            keyword=keyword,
+            front_pages_only=front_pages_only,
+            count=25,
+        )
         payload, dbg = fetch_json_debug(url)
         return url, payload, dbg
 
-    # Find a decade with any hit
-    hit_decade_start = None
+    hit_decade_start: Optional[int] = None
+
     for y in years:
         url, payload, dbg = query_year(y)
         last_debug = dbg
@@ -216,8 +241,6 @@ def decade_step_most_recent(
     if hit_decade_start is None:
         return None, None, "", last_debug
 
-    # Walk within that decade from (decade_start+3) down to decade_start
-    # e.g., if 1960 hits, also check 1963/1962/1961/1960 for most recent.
     for y in range(min(hit_decade_start + 3, 1963), hit_decade_start - 1, -1):
         url, payload, dbg = query_year(y)
         last_debug = dbg
@@ -228,6 +251,20 @@ def decade_step_most_recent(
         time.sleep(0.12)
 
     return None, None, "", last_debug
+
+
+def show_debug(dbg: Dict[str, Any]):
+    if not dbg:
+        return
+    st.write("**Debug:**")
+    st.write(f"- Status: {dbg.get('status')}")
+    st.write(f"- Content-Type: {dbg.get('content_type')}")
+    if dbg.get("error"):
+        st.error(dbg["error"])
+    if dbg.get("snippet"):
+        st.code(dbg["snippet"])
+    with st.expander("Request URL", expanded=False):
+        st.code(dbg.get("url", ""))
 
 
 def main():
@@ -253,13 +290,56 @@ def main():
 
         states = [
             "ALL",
-            "alabama","alaska","arizona","arkansas","california","colorado","connecticut","delaware",
-            "florida","georgia","hawaii","idaho","illinois","indiana","iowa","kansas","kentucky",
-            "louisiana","maine","maryland","massachusetts","michigan","minnesota","mississippi",
-            "missouri","montana","nebraska","nevada","new hampshire","new jersey","new mexico",
-            "new york","north carolina","north dakota","ohio","oklahoma","oregon","pennsylvania",
-            "rhode island","south carolina","south dakota","tennessee","texas","utah","vermont",
-            "virginia","washington","west virginia","wisconsin","wyoming"
+            "alabama",
+            "alaska",
+            "arizona",
+            "arkansas",
+            "california",
+            "colorado",
+            "connecticut",
+            "delaware",
+            "florida",
+            "georgia",
+            "hawaii",
+            "idaho",
+            "illinois",
+            "indiana",
+            "iowa",
+            "kansas",
+            "kentucky",
+            "louisiana",
+            "maine",
+            "maryland",
+            "massachusetts",
+            "michigan",
+            "minnesota",
+            "mississippi",
+            "missouri",
+            "montana",
+            "nebraska",
+            "nevada",
+            "new hampshire",
+            "new jersey",
+            "new mexico",
+            "new york",
+            "north carolina",
+            "north dakota",
+            "ohio",
+            "oklahoma",
+            "oregon",
+            "pennsylvania",
+            "rhode island",
+            "south carolina",
+            "south dakota",
+            "tennessee",
+            "texas",
+            "utah",
+            "vermont",
+            "virginia",
+            "washington",
+            "west virginia",
+            "wisconsin",
+            "wyoming",
         ]
         state = st.selectbox("Filter by state (optional)", states, index=0)
 
@@ -273,17 +353,16 @@ def main():
 
     with c1:
         if st.button("✅ Known-good example query", use_container_width=True):
-            # Official docs example (Oct–Dec 1924, cat, CA) — confirms API works at all.
+            # Official docs-like example: Oct–Dec 1924, keyword 'cat', California
             url = (
                 "https://www.loc.gov/collections/chronicling-america/"
                 "?dl=page&end_date=1924-12-31&qs=cat&start_date=1924-10-01&location_state=california&fo=json"
             )
             payload, dbg = fetch_json_debug(url)
             st.link_button("Open query used", url)
+
             if not payload:
-                st.error(dbg.get("error") or "Request failed")
-                if dbg.get("snippet"):
-                    st.code(dbg["snippet"])
+                show_debug(dbg)
             else:
                 results = parse_results(payload)
                 st.success(f"Got {len(results)} result(s). Showing first:")
@@ -291,10 +370,11 @@ def main():
                     render_item(results[0])
 
     with c2:
-        if st.button("🔎 Test this exact day in chosen year", use_container_width=True):
+        if st.button("🔎 Test exact day in chosen year", use_container_width=True):
             date_str = f"{int(year):04d}-{month:02d}-{day:02d}"
             url = build_query_url(
-                date_str, date_str,
+                date_str,
+                date_str,
                 state=state,
                 keyword=keyword,
                 front_pages_only=front_pages_only,
@@ -302,14 +382,16 @@ def main():
             )
             payload, dbg = fetch_json_debug(url)
             st.link_button("Open query used", url)
+
             if not payload:
-                st.error(dbg.get("error") or "Request failed")
-                if dbg.get("snippet"):
-                    st.code(dbg["snippet"])
+                show_debug(dbg)
             else:
                 results = parse_results(payload)
                 if not results:
-                    st.warning("Valid JSON response but 0 results for this exact date/year. Try turning off Front pages only or removing filters.")
+                    st.warning(
+                        "Valid JSON response but 0 results for this exact date/year. "
+                        "Try turning off Front pages only or removing filters."
+                    )
                 else:
                     st.success(f"Got {len(results)} result(s). Showing first:")
                     render_item(results[0])
@@ -320,21 +402,19 @@ def main():
                 y, item, url, dbg = decade_step_most_recent(
                     month, day, state=state, keyword=keyword, front_pages_only=front_pages_only
                 )
+
             if item and y and url:
                 st.success(f"Found a hit in **{y}**.")
                 st.link_button("Open query used", url)
                 render_item(item)
             else:
-                st.error("No hit found (or blocked).")
-                if dbg.get("error"):
-                    st.write(dbg["error"])
-                if dbg.get("snippet"):
-                    st.code(dbg["snippet"])
+                st.error("No hit found (or request blocked).")
+                show_debug(dbg)
 
     st.write("---")
     st.markdown("#### Troubleshooting checklist")
     st.markdown(
-        "- First click **Known-good example query**. If that fails, you’re blocked or offline.\n"
+        "- First click **Known-good example query**. If that fails, SSL or network is the issue.\n"
         "- If you get **HTTP 429 / 403** or an HTML snippet, wait a few minutes (rate limit) and retry.\n"
         "- If exact day/year returns 0 results, uncheck **Front pages only** and remove state/keyword filters.\n"
         "- Once single-year works, try **safer scan**."
