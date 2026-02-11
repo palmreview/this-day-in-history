@@ -1,13 +1,13 @@
 # This Day in History — Newspapers (Chronicling America via loc.gov)
-# Version: 0.2.4
+# Version: 0.2.5
 # Date: 2026-02-11
 #
-# Updates in 0.2.4:
-# - Adds "Use today" button that forces the date picker to today's date
-# - Shows Today's date vs Selected month/day clearly in the UI
-# - Shows the exact query window (start/end) used for each request
-# - Keeps: certifi SSL fix, known-good query, single-year test, safer scan, debug output
-# - Keeps: +/- 3 day query window + exact month/day filtering using URL date extraction
+# Fixes in 0.2.5:
+# - Hard-binds date_input to session_state via key="chosen_date"
+# - "Use today" button sets chosen_date and forces st.rerun()
+# - Uses America/New_York as the app's "today" (matches your timezone)
+# - Keeps: certifi SSL fix, known-good query, exact month/day filtering via URL date extraction,
+#         +/- window, diagnostics, decade scan.
 
 from __future__ import annotations
 
@@ -23,8 +23,23 @@ import certifi
 import ssl
 import streamlit as st
 
-APP_VERSION = "0.2.4"
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None  # fallback
+
+APP_VERSION = "0.2.5"
 BASE_COLLECTION_URL = "https://www.loc.gov/collections/chronicling-america/"
+
+
+def app_today_date() -> dt.date:
+    """Return today's date in America/New_York (fallback: local system date)."""
+    if ZoneInfo is not None:
+        try:
+            return dt.datetime.now(ZoneInfo("America/New_York")).date()
+        except Exception:
+            pass
+    return dt.date.today()
 
 
 def build_query_url(
@@ -74,7 +89,7 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "ThisDayInHistoryStreamlit/0.2.4",
+            "User-Agent": "ThisDayInHistoryStreamlit/0.2.5",
             "Accept": "application/json",
         },
     )
@@ -101,7 +116,6 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
 
     debug["status"] = status
     debug["content_type"] = content_type
-
     text = raw.decode("utf-8", errors="replace")
 
     if "json" not in (content_type or "").lower():
@@ -128,10 +142,9 @@ def parse_item_date(item: Dict[str, Any]) -> Optional[dt.date]:
     """
     Priority:
       1) ISO date in item['date'] / created_published_date / created_published (or lists)
-      2) ISO date embedded in 'aka' URLs (common)
+      2) ISO date embedded in 'aka' URLs (common for Chronicling America pages)
       3) ISO date embedded in 'url'
     """
-
     def parse_iso10(s: str) -> Optional[dt.date]:
         s = (s or "").strip()
         if len(s) >= 10:
@@ -232,26 +245,22 @@ def item_snippet(item: Dict[str, Any], max_chars: int = 700) -> str:
 
 
 def render_item(item: Dict[str, Any]):
-    t = item_title(item)
-    d = item_date_str(item)
-    link = item_link(item)
-    img = best_image_url(item)
-    snippet = item_snippet(item)
-
-    st.markdown(f"**{t}**")
-    if d:
-        st.write(f"Parsed date: **{d}**")
+    st.markdown(f"**{item_title(item)}**")
+    st.write(f"Parsed date: **{item_date_str(item)}**")
 
     cols = st.columns([1, 1])
     with cols[0]:
+        img = best_image_url(item)
         if img:
             st.image(img, use_container_width=True)
         else:
             st.info("No image_url found for this result (the item link may still show the page).")
 
     with cols[1]:
+        link = item_link(item)
         if link:
             st.link_button("Open item on loc.gov", link)
+        snippet = item_snippet(item)
         if snippet:
             st.markdown("**OCR / snippet:**")
             st.write(snippet)
@@ -286,26 +295,24 @@ def decade_step_most_recent(
     last_debug: Dict[str, Any] = {}
 
     def query_year(y: int):
-        start_date, end_date = make_window(y, month, day, window_days=3)
+        win = make_window(y, month, day, window_days=3)
         url = build_query_url(
-            start_date,
-            end_date,
+            win[0],
+            win[1],
             state=state,
             keyword=keyword,
             front_pages_only=front_pages_only,
             count=100,
         )
         payload, dbg = fetch_json_debug(url)
-        return (start_date, end_date), url, payload, dbg
+        return win, url, payload, dbg
 
     hit_decade_start: Optional[int] = None
-
     for y in years:
         win, url, payload, dbg = query_year(y)
         last_debug = dbg
         if payload:
-            results = parse_results(payload)
-            exact = filter_exact_month_day(results, month, day)
+            exact = filter_exact_month_day(parse_results(payload), month, day)
             if exact:
                 hit_decade_start = y
                 break
@@ -318,8 +325,7 @@ def decade_step_most_recent(
         win, url, payload, dbg = query_year(y)
         last_debug = dbg
         if payload:
-            results = parse_results(payload)
-            exact = filter_exact_month_day(results, month, day)
+            exact = filter_exact_month_day(parse_results(payload), month, day)
             if exact:
                 return y, exact[0], url, dbg, len(exact), win
         time.sleep(0.15)
@@ -362,28 +368,24 @@ def main():
     st.title("🗞️ This Day in History — Newspapers")
     st.caption(f"App v{APP_VERSION} · loc.gov Chronicling America collection search.")
 
-    today = dt.date.today()
+    today = app_today_date()
 
-    # Session-backed date so we can "force reset" to today reliably
+    # Initialize chosen_date once
     if "chosen_date" not in st.session_state:
         st.session_state["chosen_date"] = today
 
     with st.sidebar:
         st.header("Controls")
 
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            if st.button("Use today", use_container_width=True):
-                st.session_state["chosen_date"] = today
-        with col_b:
-            st.caption(f"Today: {today.isoformat()}")
+        if st.button("Use today (America/New_York)", use_container_width=True):
+            st.session_state["chosen_date"] = today
+            st.rerun()
 
-        chosen = st.date_input("Pick a date (month/day used)", value=st.session_state["chosen_date"])
-        # keep session state aligned with manual changes
-        st.session_state["chosen_date"] = chosen
+        # IMPORTANT: bind date_input to session_state via key
+        st.date_input("Pick a date (month/day used)", key="chosen_date")
 
         year = st.number_input(
-            "Test a specific year (recommended first)",
+            "Test a specific year",
             min_value=1690,
             max_value=1963,
             value=1955,
@@ -406,18 +408,16 @@ def main():
         ]
         state = st.selectbox("Filter by state (optional)", states, index=0)
 
-        st.write("---")
-        st.caption("If you see HTTP 429/403 or HTML, you’re likely rate-limited. Wait a few minutes and retry.")
-
+    chosen: dt.date = st.session_state["chosen_date"]
     month, day = chosen.month, chosen.day
 
-    top1, top2 = st.columns(2)
-    with top1:
-        st.markdown(f"### Selected month/day: **{chosen.strftime('%B %d')}**")
-    with top2:
-        st.markdown(f"### System today: **{today.strftime('%B %d')}**")
-
-    st.caption("If these don’t match, click **Use today** in the sidebar.")
+    # Big, unmissable status line
+    st.markdown(
+        f"### App today (ET): **{today.strftime('%B %d, %Y')}**  \n"
+        f"### Selected: **{chosen.strftime('%B %d, %Y')}**"
+    )
+    if (today.month, today.day) != (chosen.month, chosen.day):
+        st.warning("Selected month/day does NOT match App today. Click **Use today** in the sidebar.")
 
     c1, c2, c3 = st.columns(3)
 
@@ -429,7 +429,6 @@ def main():
             )
             payload, dbg = fetch_json_debug(url)
             st.link_button("Open query used", url)
-
             if not payload:
                 show_debug(dbg)
             else:
@@ -461,10 +460,7 @@ def main():
                 exact = filter_exact_month_day(results, month, day)
 
                 if not exact:
-                    st.warning(
-                        "Valid JSON response, but no items matched the exact month/day after filtering. "
-                        "Try unchecking Front pages only, removing state/keyword filters, or picking another year."
-                    )
+                    st.warning("Valid JSON response, but no items matched the exact month/day after filtering.")
                     show_no_match_diagnostics(results)
                 else:
                     st.success(f"Got {len(exact)} exact match(es). Showing first:")
@@ -485,14 +481,6 @@ def main():
             else:
                 st.error("No exact match found (or request blocked).")
                 show_debug(dbg)
-
-    st.write("---")
-    st.markdown("#### Notes")
-    st.markdown(
-        "- If you see results for **Aug 01** (like `1955-08-01`), your selected date is Aug 1.\n"
-        "- Click **Use today** to force the selection back to today.\n"
-        "- The app filters exact month/day using the real date embedded in `aka`/`url`."
-    )
 
 
 if __name__ == "__main__":
