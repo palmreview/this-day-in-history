@@ -1,11 +1,12 @@
 # This Day in History — Newspapers (Chronicling America via loc.gov)
-# Version: 0.2.1
+# Version: 0.2.2
 # Date: 2026-02-11
 #
-# Fixes:
-# - Uses certifi CA bundle to avoid SSL CERTIFICATE_VERIFY_FAILED on some environments
-# - Adds "Known-good example query" + single-year test + safer decade-step scan
-# - Shows useful HTTP/HTML error snippets instead of silently failing
+# Updates in 0.2.2:
+# - Enforces exact "today's month/day" matching by filtering results locally
+# - Uses a small date window (+/- 3 days) when querying (API can return near-date items)
+# - Keeps certifi SSL fix to avoid CERTIFICATE_VERIFY_FAILED
+# - Keeps: known-good query, single-year test, safer scan, debug output
 #
 # Requirements:
 #   pip install streamlit certifi
@@ -26,7 +27,7 @@ import certifi
 import ssl
 import streamlit as st
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 BASE_COLLECTION_URL = "https://www.loc.gov/collections/chronicling-america/"
 
 
@@ -82,7 +83,7 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "ThisDayInHistoryStreamlit/0.2.1",
+            "User-Agent": "ThisDayInHistoryStreamlit/0.2.2",
             "Accept": "application/json",
         },
     )
@@ -99,7 +100,7 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
         debug["error"] = f"HTTPError {e.code}: {e.reason}"
         try:
             raw = e.read()
-            debug["snippet"] = raw[:600].decode("utf-8", errors="replace")
+            debug["snippet"] = raw[:800].decode("utf-8", errors="replace")
         except Exception:
             pass
         return None, debug
@@ -115,7 +116,7 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
     # If blocked or an error page is returned, it may be HTML
     if "json" not in (content_type or "").lower():
         debug["error"] = f"Non-JSON response (Content-Type: {content_type})"
-        debug["snippet"] = text[:600]
+        debug["snippet"] = text[:800]
         return None, debug
 
     try:
@@ -124,13 +125,49 @@ def fetch_json_debug(url: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]
         return payload, debug
     except Exception as e:
         debug["error"] = f"JSON parse failed: {e}"
-        debug["snippet"] = text[:600]
+        debug["snippet"] = text[:800]
         return None, debug
 
 
 def parse_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     results = payload.get("results", [])
     return results if isinstance(results, list) else []
+
+
+def parse_item_date(item: Dict[str, Any]) -> Optional[dt.date]:
+    """
+    Attempts to parse a date from loc.gov result fields.
+    Returns a dt.date or None.
+    """
+    date_str = (
+        item.get("date")
+        or item.get("created_published_date")
+        or item.get("created_published")
+    )
+    if not date_str:
+        return None
+
+    # Many are ISO-like; take first 10 chars (YYYY-MM-DD)
+    s = str(date_str).strip()
+    if len(s) >= 10:
+        s10 = s[:10]
+        try:
+            return dt.date.fromisoformat(s10)
+        except Exception:
+            return None
+    return None
+
+
+def filter_exact_month_day(results: List[Dict[str, Any]], month: int, day: int) -> List[Dict[str, Any]]:
+    """
+    Filters API results to only those that match the exact month/day.
+    """
+    exact: List[Dict[str, Any]] = []
+    for item in results:
+        d = parse_item_date(item)
+        if d and d.month == month and d.day == day:
+            exact.append(item)
+    return exact
 
 
 def best_image_url(item: Dict[str, Any]) -> Optional[str]:
@@ -146,8 +183,9 @@ def item_title(item: Dict[str, Any]) -> str:
     return str(item.get("title") or "Untitled")
 
 
-def item_date(item: Dict[str, Any]) -> str:
-    return str(item.get("date") or item.get("created_published_date") or item.get("created_published") or "").strip()
+def item_date_str(item: Dict[str, Any]) -> str:
+    d = parse_item_date(item)
+    return d.isoformat() if d else str(item.get("date") or item.get("created_published_date") or item.get("created_published") or "").strip()
 
 
 def item_link(item: Dict[str, Any]) -> Optional[str]:
@@ -173,14 +211,14 @@ def item_snippet(item: Dict[str, Any], max_chars: int = 700) -> str:
 
 def render_item(item: Dict[str, Any]):
     t = item_title(item)
-    d = item_date(item)
+    d = item_date_str(item)
     link = item_link(item)
     img = best_image_url(item)
     snippet = item_snippet(item)
 
     st.markdown(f"**{t}**")
     if d:
-        st.write(f"Date field: {d}")
+        st.write(f"Parsed date: **{d}**")
 
     cols = st.columns([1, 1])
     with cols[0]:
@@ -197,6 +235,41 @@ def render_item(item: Dict[str, Any]):
             st.write(snippet)
 
 
+def clamp_day(year: int, month: int, day: int) -> int:
+    """
+    Clamp the day into the valid range for the given month/year.
+    (Handles Feb 29, month lengths, etc.)
+    """
+    if day < 1:
+        day = 1
+    if day > 31:
+        day = 31
+
+    # Get last day of month
+    if month == 12:
+        next_month = dt.date(year + 1, 1, 1)
+    else:
+        next_month = dt.date(year, month + 1, 1)
+    last_day = (next_month - dt.timedelta(days=1)).day
+    return min(day, last_day)
+
+
+def make_window(year: int, month: int, day: int, window_days: int = 3) -> Tuple[str, str]:
+    """
+    Returns (start_date, end_date) in ISO format for a +/- window_days window,
+    clamped safely within the month/year.
+    """
+    # Center date may be invalid (Feb 29 in non-leap year), so clamp first.
+    safe_day = clamp_day(year, month, day)
+    center = dt.date(year, month, safe_day)
+
+    start = center - dt.timedelta(days=window_days)
+    end = center + dt.timedelta(days=window_days)
+
+    # loc.gov uses inclusive dates; that's fine for our filtering
+    return start.isoformat(), end.isoformat()
+
+
 def decade_step_most_recent(
     month: int,
     day: int,
@@ -206,49 +279,55 @@ def decade_step_most_recent(
     front_pages_only: bool,
 ) -> Tuple[Optional[int], Optional[Dict[str, Any]], str, Dict[str, Any]]:
     """
-    Fewer requests than year-by-year:
-    - check decade anchors (1960, 1950, ...)
-    - once a decade hits, walk within that decade for the most recent hit
+    Safer scan (fewer requests):
+    - checks decade anchors (1960, 1950, ...)
+    - if a decade has any exact-month/day match, walks within that decade for the most recent match
+    - each query uses a +/-3 day window, then locally filters to exact month/day
     """
     years = list(range(1960, 1689, -10))
     last_debug: Dict[str, Any] = {}
 
     def query_year(y: int):
-        date_str = f"{y:04d}-{month:02d}-{day:02d}"
+        start_date, end_date = make_window(y, month, day, window_days=3)
         url = build_query_url(
-            date_str,
-            date_str,
+            start_date,
+            end_date,
             state=state,
             keyword=keyword,
             front_pages_only=front_pages_only,
-            count=25,
+            count=50,
         )
         payload, dbg = fetch_json_debug(url)
         return url, payload, dbg
 
     hit_decade_start: Optional[int] = None
 
+    # 1) Find a decade with any exact match
     for y in years:
         url, payload, dbg = query_year(y)
         last_debug = dbg
         if payload:
             results = parse_results(payload)
-            if results:
+            exact = filter_exact_month_day(results, month, day)
+            if exact:
                 hit_decade_start = y
                 break
-        time.sleep(0.12)
+        time.sleep(0.15)
 
     if hit_decade_start is None:
         return None, None, "", last_debug
 
-    for y in range(min(hit_decade_start + 3, 1963), hit_decade_start - 1, -1):
+    # 2) Search within that decade for most recent year with an exact match
+    for y in range(min(hit_decade_start + 9, 1963), hit_decade_start - 1, -1):
         url, payload, dbg = query_year(y)
         last_debug = dbg
         if payload:
             results = parse_results(payload)
-            if results:
-                return y, results[0], url, dbg
-        time.sleep(0.12)
+            exact = filter_exact_month_day(results, month, day)
+            if exact:
+                # Prefer the first match returned; could be improved later by sorting
+                return y, exact[0], url, dbg
+        time.sleep(0.15)
 
     return None, None, "", last_debug
 
@@ -270,7 +349,7 @@ def show_debug(dbg: Dict[str, Any]):
 def main():
     st.set_page_config(page_title="This Day in History — Newspapers", layout="wide")
     st.title("🗞️ This Day in History — Newspapers")
-    st.caption(f"App v{APP_VERSION} · Data via loc.gov Chronicling America collection search.")
+    st.caption(f"App v{APP_VERSION} · loc.gov Chronicling America collection search.")
 
     with st.sidebar:
         st.header("Controls")
@@ -348,12 +427,13 @@ def main():
 
     month, day = chosen.month, chosen.day
     st.markdown(f"### Target date: **{chosen.strftime('%B %d')}**")
+    st.caption("We enforce exact month/day by locally filtering results to match the selected date.")
 
     c1, c2, c3 = st.columns(3)
 
     with c1:
         if st.button("✅ Known-good example query", use_container_width=True):
-            # Official docs-like example: Oct–Dec 1924, keyword 'cat', California
+            # Example query: Oct–Dec 1924, keyword 'cat', California (range-based)
             url = (
                 "https://www.loc.gov/collections/chronicling-america/"
                 "?dl=page&end_date=1924-12-31&qs=cat&start_date=1924-10-01&location_state=california&fo=json"
@@ -370,15 +450,16 @@ def main():
                     render_item(results[0])
 
     with c2:
-        if st.button("🔎 Test exact day in chosen year", use_container_width=True):
-            date_str = f"{int(year):04d}-{month:02d}-{day:02d}"
+        if st.button("🔎 Test exact month/day in chosen year", use_container_width=True):
+            # Use a +/- window then filter exact month/day
+            start_date, end_date = make_window(int(year), month, day, window_days=3)
             url = build_query_url(
-                date_str,
-                date_str,
+                start_date,
+                end_date,
                 state=state,
                 keyword=keyword,
                 front_pages_only=front_pages_only,
-                count=25,
+                count=50,
             )
             payload, dbg = fetch_json_debug(url)
             st.link_button("Open query used", url)
@@ -387,37 +468,42 @@ def main():
                 show_debug(dbg)
             else:
                 results = parse_results(payload)
-                if not results:
+                exact = filter_exact_month_day(results, month, day)
+
+                if not exact:
                     st.warning(
-                        "Valid JSON response but 0 results for this exact date/year. "
-                        "Try turning off Front pages only or removing filters."
+                        "Valid JSON response, but no items matched the exact month/day after filtering. "
+                        "Try unchecking Front pages only, removing state/keyword filters, or picking another year."
                     )
                 else:
-                    st.success(f"Got {len(results)} result(s). Showing first:")
-                    render_item(results[0])
+                    st.success(f"Got {len(exact)} exact match(es). Showing first:")
+                    render_item(exact[0])
+
+                    with st.expander("Show all exact matches (titles/dates)", expanded=False):
+                        for i, it in enumerate(exact[:25], start=1):
+                            st.write(f"{i}. {item_date_str(it)} — {item_title(it)}")
 
     with c3:
-        if st.button("⏪ Find most recent available (safer scan)", use_container_width=True):
-            with st.spinner("Scanning by decade to reduce requests…"):
+        if st.button("⏪ Find most recent available (exact match)", use_container_width=True):
+            with st.spinner("Scanning by decade (+/- 3-day windows), then filtering to exact month/day…"):
                 y, item, url, dbg = decade_step_most_recent(
                     month, day, state=state, keyword=keyword, front_pages_only=front_pages_only
                 )
 
             if item and y and url:
-                st.success(f"Found a hit in **{y}**.")
+                st.success(f"Found an exact {chosen.strftime('%b %d')} match in **{y}**.")
                 st.link_button("Open query used", url)
                 render_item(item)
             else:
-                st.error("No hit found (or request blocked).")
+                st.error("No exact match found (or request blocked).")
                 show_debug(dbg)
 
     st.write("---")
-    st.markdown("#### Troubleshooting checklist")
+    st.markdown("#### Notes")
     st.markdown(
-        "- First click **Known-good example query**. If that fails, SSL or network is the issue.\n"
-        "- If you get **HTTP 429 / 403** or an HTML snippet, wait a few minutes (rate limit) and retry.\n"
-        "- If exact day/year returns 0 results, uncheck **Front pages only** and remove state/keyword filters.\n"
-        "- Once single-year works, try **safer scan**."
+        "- The API can return near-date items even when you request an exact date.\n"
+        "- This app now queries a small window and **filters locally** to guarantee exact month/day.\n"
+        "- If you filter too much (Front pages only + state + keyword), you may get no exact matches."
     )
 
 
