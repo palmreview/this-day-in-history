@@ -1,6 +1,6 @@
 # This Day in History — Newspapers (Chronicling America via loc.gov)
-# Version: 0.5.8
-# Date: 2026-02-17
+# Version: 0.5.10
+# Date: 2026-02-19
 #
 # New in 0.5.7 (keeps existing functionality):
 # - FIX: OCR-first is now robust by fetching Chronicling America /ocr/ text when loc.gov JSON lacks full_text.
@@ -81,7 +81,7 @@ except Exception:
     insert_link = None
     list_links = None
 
-APP_VERSION = "0.5.8"
+APP_VERSION = "0.5.11"
 BASE_COLLECTION_URL = "https://www.loc.gov/collections/chronicling-america/"
 
 TOPIC_PRESETS = [
@@ -119,6 +119,85 @@ Output:
 Keep it factual; if scan quality is uncertain, say so.
 Avoid long verbatim quotes (short phrases only).
 """
+
+# ----------------------------
+# Prompt modes (for deeper analysis / transcription)
+# ----------------------------
+DOC_MODE_PRESETS: Dict[str, str] = {
+    "Summary + Deep dive (default)": PDF_SUMMARY_PRESET_PROMPT,
+    "Historical analysis": (
+        "You are my newspaper research assistant.\n"
+        "Analyze this newspaper page for historical understanding.\n\n"
+        "Output:\n"
+        "1) What is the main event/story of the day on this page? (3–6 bullets)\n"
+        "2) Historical context: what was happening locally, nationally, and internationally?\n"
+        "3) Tone/bias/framing: note loaded language, omissions, and assumptions typical of the era\n"
+        "4) Key people/places/organizations (bulleted, with short roles)\n"
+        "5) Timeline of dates/events mentioned\n"
+        "6) Why it matters: 3–5 takeaways\n"
+        "7) SPORTS section if present\n\n"
+        "Keep it factual; if scan/OCR quality is uncertain, say so. Avoid long verbatim quotes."
+    ),
+    "Word-for-word transcription": (
+        "You are performing historical transcription.\n"
+        "Transcribe the newspaper content word-for-word as best as possible.\n\n"
+        "Rules:\n"
+        "- Do NOT summarize.\n"
+        "- Preserve spelling, capitalization, and punctuation as printed.\n"
+        "- Keep paragraph breaks; if columns are obvious, separate columns with a blank line.\n"
+        "- If text is unclear, mark it as [unclear].\n"
+        "- Avoid adding any commentary.\n\n"
+        "If the page is long, transcribe the most prominent stories first, then continue until you reach a reasonable length."
+    ),
+    "Extract names & roles": (
+        "Extract ALL named people, places, and organizations from the page.\n"
+        "For each, provide a short role/why they are mentioned.\n"
+        "Then group them into categories: People / Places / Organizations.\n"
+        "Do not summarize the whole page beyond what's needed for roles."
+    ),
+    "Sports only": (
+        "Focus ONLY on sports content on the page.\n"
+        "Summarize games, teams, scores, standings, player names, and any notable sports headlines.\n"
+        "If there is no sports content, say 'No sports items found.'"
+    ),
+    "Timeline only": (
+        "Create a chronological timeline of events mentioned on the page.\n"
+        "Include explicit dates and also relative references (e.g., 'yesterday', 'last week') with inferred dates if possible.\n"
+        "If dates are uncertain, note uncertainty."
+    ),
+
+    "Medical & Health History": """You are my newspaper research assistant specializing in historical medicine and public health.
+
+Analyze this newspaper page and extract all references to:
+
+• Diseases or epidemics
+• Medical treatments or surgical procedures
+• Public health efforts or warnings
+• Hospitals, doctors, or medical institutions
+• Patent medicines, tonics, elixirs, or health products
+• Advertisements claiming health benefits
+
+For each medical reference:
+- Describe what is being claimed or reported
+- Explain the historical medical understanding at that time
+- Briefly compare with modern medical knowledge (if relevant)
+
+Separate clearly:
+1) Legitimate medical reporting
+2) Health-related advertisements or commercial products
+
+Then provide:
+• Notable diseases mentioned
+• Notable medical figures or institutions
+• Cultural attitudes toward illness reflected in the page
+• 3–5 historical significance takeaways
+
+Keep it factual.
+Do not modernize language unless explaining context.
+If scan quality is uncertain, say so.
+Avoid long verbatim quotes (short phrases only).
+""",
+}
 
 
 # ----------------------------
@@ -581,15 +660,42 @@ def run_search_and_store():
         return
 
     results = parse_results(payload)
+
+    # If we got very few results, widen the window to improve the chance of finding this month/day.
+    # Chronicling America coverage can be sparse for a given year.
+    if len(results) < 5:
+        start_date2, end_date2 = make_window(year, month, day, window_days=14)
+        url2 = build_query_url(
+            start_date2,
+            end_date2,
+            keyword=keyword,
+            front_pages_only=front_pages_only,
+            count=100,
+        )
+        payload2, _dbg2 = fetch_json_debug(url2)
+        if payload2 and isinstance(payload2, dict):
+            results2 = parse_results(payload2)
+            if len(results2) > len(results):
+                results = results2
+                st.session_state["last_query_url_wide"] = url2
+    
     exact = filter_exact_month_day(results, month, day)
     st.session_state["last_exact_all"] = exact
 
-    final = exact
+    # If there are no exact month/day matches, keep a "near matches" fallback so the app still shows results.
+    using_near = False
+    near = exact
+    if not exact:
+        using_near = True
+        near = results[:50] if isinstance(results, list) else []
+
+    final = near
     if require_keyword and (keyword or "").strip():
         with st.spinner("Filtering by keyword in OCR (client-side)…"):
             final = filter_by_keyword_client_side(exact, keyword)
 
     st.session_state["last_exact_final"] = final
+    st.session_state["using_near_matches"] = using_near
     st.session_state["last_error"] = {}
     st.session_state["result_index"] = 0
 
@@ -850,6 +956,59 @@ def fetch_loc_page_json(page_url: str) -> Optional[Dict[str, Any]]:
 def _extract_pdf_url(payload: Dict[str, Any]) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
+
+def _find_pdf_urls_in_payload(payload: Dict[str, Any], limit: int = 30) -> List[str]:
+    """
+    Find PDF URLs nested in loc.gov JSON. Prefer direct NDNP storage-services PDFs.
+    """
+    found: List[str] = []
+    if not isinstance(payload, dict):
+        return found
+
+    def walk(x: Any):
+        if len(found) >= limit:
+            return
+        if isinstance(x, str):
+            s = x.strip()
+            if s.startswith("http") and ".pdf" in s.lower():
+                found.append(s)
+            return
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+            return
+        if isinstance(x, list):
+            for v in x:
+                walk(v)
+            return
+
+    walk(payload)
+
+    # normalize + dedupe
+    out: List[str] = []
+    seen = set()
+    for u in found:
+        u2 = u.strip()
+        if u2.startswith("//"):
+            u2 = "https:" + u2
+        if u2.startswith("http"):
+            # keep query (some downloads might depend on it), but dedupe on full string
+            if u2 not in seen:
+                out.append(u2)
+                seen.add(u2)
+
+    def score(u: str) -> Tuple[int, int]:
+        lu = u.lower()
+        s = 0
+        if "tile.loc.gov/storage-services/service/ndnp" in lu:
+            s += 100
+        if lu.endswith(".pdf"):
+            s += 10
+        return (s, -len(u))
+
+    out.sort(key=score, reverse=True)
+    return out
+
     v = payload.get("pdf")
     if isinstance(v, list) and v:
         u = str(v[0]).strip()
@@ -862,6 +1021,15 @@ def _extract_pdf_url(payload: Dict[str, Any]) -> Optional[str]:
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def fetch_loc_pdf_url(page_url: str) -> Optional[str]:
+    """
+    Return the best candidate PDF URL for a loc.gov newspaper page.
+
+    Tries:
+      1) loc.gov JSON `pdf`
+      2) any nested PDF URLs (prefer tile.loc.gov/storage-services/service/ndnp/*.pdf)
+      3) /item/ fallback JSON
+      4) Chronicling America constructed seq-{sp}.pdf (may redirect to tile.loc.gov)
+    """
     if not page_url:
         return None
 
@@ -870,6 +1038,9 @@ def fetch_loc_pdf_url(page_url: str) -> Optional[str]:
         u = _extract_pdf_url(payload)
         if u:
             return u
+        more = _find_pdf_urls_in_payload(payload)
+        if more:
+            return more[0]
 
     item_url = resource_url_to_item_url(page_url)
     if item_url != page_url:
@@ -878,6 +1049,9 @@ def fetch_loc_pdf_url(page_url: str) -> Optional[str]:
             u2 = _extract_pdf_url(payload2)
             if u2:
                 return u2
+            more2 = _find_pdf_urls_in_payload(payload2)
+            if more2:
+                return more2[0]
 
     return chroniclingamerica_pdf_url_from_loc_page(page_url)
 
@@ -1001,76 +1175,108 @@ def fetch_all_image_urls(page_url: str) -> List[str]:
     return urls
 
 
-def pick_best_image_url(urls: List[str]) -> Optional[str]:
-    """Heuristic: prefer likely high-res formats and 'full/large' variants."""
-    if not urls:
-        return None
+def pick_best_image_url(urls: List[str]) -> List[str]:
+    """
+    Return candidate image URLs ordered best->worst for OCR.
 
-    def score(u: str) -> Tuple[int, int]:
+    - Prefer IIIF JPG/PNG URLs we can upscale to full size.
+    - De-prioritize raw JP2/TIFF because Pillow often can't decode them without extra codecs.
+    """
+    if not urls:
+        return []
+
+    def is_iiif(u: str) -> bool:
         lu = u.lower()
-        ext_bonus = 0
-        if ".jp2" in lu or "jp2" in lu:
-            ext_bonus = 30
-        elif ".tif" in lu or ".tiff" in lu:
-            ext_bonus = 25
+        return ("/image-services/iiif/" in lu) or ("/iiif/" in lu and "default.jpg" in lu)
+
+    def score(u: str) -> Tuple[int, int, int]:
+        lu = u.lower()
+
+        fmt = 0
+        if ".jpg" in lu or ".jpeg" in lu:
+            fmt = 30
         elif ".png" in lu:
-            ext_bonus = 10
-        elif ".jpg" in lu or ".jpeg" in lu:
-            ext_bonus = 5
+            fmt = 25
+        elif ".jp2" in lu or "jp2" in lu:
+            fmt = 5
+        elif ".tif" in lu or ".tiff" in lu:
+            fmt = 3
+
+        iiif_bonus = 20 if is_iiif(u) else 0
 
         size_hint = 0
+        if "/full/full/" in lu:
+            size_hint += 20
+        if "pct:" in lu:
+            mm = re.search(r"pct:(\d{1,3})", lu)
+            if mm:
+                try:
+                    pct = int(mm.group(1))
+                    size_hint += max(0, 15 - pct // 10)
+                except Exception:
+                    pass
         if "full" in lu:
-            size_hint += 15
+            size_hint += 5
         if "large" in lu:
-            size_hint += 10
+            size_hint += 3
 
-        # mild hint based on numbers that sometimes appear in size params
-        nums = re.findall(r"(\d{3,5})", lu)
-        if nums:
-            try:
-                size_hint += max(int(x) for x in nums[-3:]) // 250
-            except Exception:
-                pass
+        return (iiif_bonus, fmt, size_hint)
 
-        return (ext_bonus, size_hint)
-
-    return sorted(urls, key=score, reverse=True)[0]
+    return [u for u in sorted(urls, key=score, reverse=True)]
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def fetch_image_ocr_text(page_url: str) -> str:
-    """Attempt full-page OCR from the best available loc.gov page image."""
+    """
+    Attempt full-page OCR from the best available loc.gov page image (no PDF).
+    This does NOT require crop selection.
+
+    Strategy:
+    - Gather all image_url candidates from loc.gov JSON (with /item/ fallback)
+    - Prefer IIIF URLs and request FULL size for OCR (avoid pct thumbnails)
+    - Try multiple candidates until one decodes successfully
+    """
     if not page_url:
         return ""
     if not (PIL_OK and TESS_OK and Image is not None and pytesseract is not None):
         return ""
 
     urls = fetch_all_image_urls(page_url)
-    best = pick_best_image_url(urls)
-    if not best:
+    candidates = pick_best_image_url(urls)
+    if not candidates:
         return ""
 
-    pil = fetch_image_pil(best)
-    if pil is None:
-        return ""
+    def iiif_full(u: str) -> str:
+        # Convert IIIF thumbnail URLs like .../full/pct:25/0/default.jpg -> .../full/full/0/default.jpg
+        uu = re.sub(r"/full/pct:\d{1,3}/", "/full/full/", u)
+        # Convert explicit size like /full/1000,/0/default.jpg -> /full/full/0/default.jpg
+        uu = re.sub(r"/full/!?\d{2,5},\d{0,5}/", "/full/full/", uu)
+        uu = re.sub(r"/full/!?\d{2,5},/", "/full/full/", uu)
+        return uu
 
-    # Preprocess for OCR (full-page; no crop selection)
-    try:
-        pre = preprocess_for_ocr(
-            pil,
-            upscale=2,
-            grayscale=True,
-            autocontrast=True,
-            threshold=False,
-            thresh_value=160,
-        )
-        txt = ocr_image_region(pre, psm=4)  # 4=columns
-        return " ".join((txt or "").split())
-    except Exception:
-        return ""
+    for u in candidates[:10]:
+        u2 = iiif_full(u)
+        pil = fetch_image_pil(u2)
+        if pil is None:
+            continue
 
+        try:
+            pre = preprocess_for_ocr(
+                pil,
+                upscale=2,
+                grayscale=True,
+                autocontrast=True,
+                threshold=False,
+                thresh_value=160,
+            )
+            txt = ocr_image_region(pre, psm=4)  # 4=columns
+            cleaned = " ".join((txt or "").split())
+            if len(cleaned) >= 1200:
+                return cleaned
+        except Exception:
+            continue
 
-
+    return ""
 # ----------------------------
 # Robust PDF downloading (validate real PDF bytes)
 # ----------------------------
@@ -1466,6 +1672,64 @@ def openai_followup(
         return f"OpenAI request failed: {type(e).__name__}: {e}", previous_response_id or ""
 
 
+
+
+def extract_story_options(summary_text: str, max_items: int = 12) -> List[Tuple[str, str]]:
+    """
+    Best-effort extraction of "story" chunks from a page summary so the user can focus follow-up prompts.
+
+    Works with common formats:
+      - Numbered sections: "1) ...", "2. ...", "3 - ..."
+      - Headings like "STORY 1:" or "ITEM 1:"
+      - Otherwise falls back to paragraph blocks.
+    Returns list of (label, text).
+    """
+    s = (summary_text or "").strip()
+    if not s:
+        return []
+
+    # Normalize newlines
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Prefer explicit numbered blocks
+    # Split while keeping the number as a label when possible.
+    numbered = list(re.finditer(r"(?m)^\s*(\d{1,2})\s*[\)\.\:\-]\s+", s))
+    if len(numbered) >= 2:
+        chunks: List[Tuple[str, str]] = []
+        starts = [m.start() for m in numbered] + [len(s)]
+        nums = [m.group(1) for m in numbered]
+        for i in range(len(numbered)):
+            block = s[starts[i]:starts[i+1]].strip()
+            if block:
+                label = f"Item {nums[i]}"
+                chunks.append((label, block))
+            if len(chunks) >= max_items:
+                break
+        return chunks
+
+    # Headings like "STORY 1:" / "ITEM 1:"
+    heading = list(re.finditer(r"(?m)^\s*(story|item)\s*(\d{1,2})\s*[:\-]\s*", s, flags=re.IGNORECASE))
+    if len(heading) >= 2:
+        chunks = []
+        starts = [m.start() for m in heading] + [len(s)]
+        labels = [f"{m.group(1).title()} {m.group(2)}" for m in heading]
+        for i in range(len(heading)):
+            block = s[starts[i]:starts[i+1]].strip()
+            if block:
+                chunks.append((labels[i], block))
+            if len(chunks) >= max_items:
+                break
+        return chunks
+
+    # Fallback: paragraph blocks (skip tiny ones)
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", s) if p.strip()]
+    chunks = []
+    for i, p in enumerate(paras[:max_items]):
+        if len(p) < 120:
+            continue
+        label = f"Section {len(chunks)+1}"
+        chunks.append((label, p))
+    return chunks[:max_items]
 def render_doc_chat_ui(
     *,
     namespace: str,
@@ -1476,6 +1740,7 @@ def render_doc_chat_ui(
     default_prompt: str = PDF_SUMMARY_PRESET_PROMPT,
     ocr_text: str = "",
     pdf_bytes: Optional[bytes] = None,
+    ui_prefix: str = "",
 ):
     """Reusable doc chat UI.
     mode:
@@ -1494,6 +1759,31 @@ def render_doc_chat_ui(
     thread_key = make_thread_key(namespace=namespace, doc_id=doc_id)
     state = _get_thread_state(thread_key, title_hint=title_hint, source_url=source_url, doc_id=doc_id)
 
+    # Prompt mode (separate from OCR/PDF mode). Changing this replaces the initial prompt text.
+    prompt_key = _wk("oa_prompt", thread_key, ui_prefix)
+    prompt_mode_key = _wk("oa_prompt_mode", thread_key, ui_prefix)
+
+    def _apply_prompt_preset():
+        sel = str(st.session_state.get(prompt_mode_key, "Summary + Deep dive (default)"))
+        st.session_state[prompt_key] = DOC_MODE_PRESETS.get(sel, default_prompt)
+
+    # Initialize prompt to the selected mode preset (only before widgets render)
+    if prompt_mode_key not in st.session_state:
+        st.session_state[prompt_mode_key] = "Summary + Deep dive (default)"
+    if prompt_key not in st.session_state:
+        st.session_state[prompt_key] = DOC_MODE_PRESETS.get(str(st.session_state[prompt_mode_key]), default_prompt)
+
+    st.selectbox(
+        "Prompt mode",
+        options=list(DOC_MODE_PRESETS.keys()),
+        index=list(DOC_MODE_PRESETS.keys()).index(str(st.session_state[prompt_mode_key]))
+        if str(st.session_state[prompt_mode_key]) in DOC_MODE_PRESETS
+        else 0,
+        help="Choose a preset analysis mode. Changing this will replace the Initial prompt text box below.",
+        key=prompt_mode_key,
+        on_change=_apply_prompt_preset,
+    )
+
     # Lock mode for this thread once it starts (so follow-ups remain consistent)
     if state.get("mode"):
         mode = state["mode"]
@@ -1508,23 +1798,23 @@ def render_doc_chat_ui(
         options=[DEFAULT_OPENAI_MODEL, "gpt-4o"],
         index=0,
         help="gpt-4o-mini is cheaper/faster; gpt-4o can be stronger on messy scans.",
-        key=_wk("oa_model", thread_key),
+        key=_wk("oa_model", thread_key, ui_prefix),
     )
 
     prompt = st.text_area(
         "Initial prompt (edit if you want)",
         value=default_prompt,
         height=170,
-        key=_wk("oa_prompt", thread_key),
+        key=prompt_key,
     )
 
     b1, b2, b3 = st.columns([0.42, 0.33, 0.25])
     with b1:
-        run_initial = st.button("Run initial summary", use_container_width=True, key=_wk("oa_run_initial", thread_key))
+        run_initial = st.button("Run initial summary", use_container_width=True, key=_wk("oa_run_initial", thread_key, ui_prefix))
     with b2:
-        new_thread = st.button("New thread (same item)", use_container_width=True, key=_wk("oa_new_thread", thread_key))
+        new_thread = st.button("New thread (same item)", use_container_width=True, key=_wk("oa_new_thread", thread_key, ui_prefix))
     with b3:
-        reset = st.button("Reset chat", use_container_width=True, key=_wk("oa_reset", thread_key))
+        reset = st.button("Reset chat", use_container_width=True, key=_wk("oa_reset", thread_key, ui_prefix))
 
     if new_thread:
         salt = dt.datetime.utcnow().isoformat()
@@ -1613,20 +1903,85 @@ def render_doc_chat_ui(
     # Follow-up form
     if state.get("last_response_id"):
         st.write("---")
-        with st.form(key=_wk("oa_followup_form", thread_key), clear_on_submit=True):
+
+        # Focus selector: pick a specific story/section from the latest assistant output
+        latest_assistant = ""
+        for _m in reversed(state.get("messages", [])):
+            if _m.get("role") == "assistant":
+                latest_assistant = str(_m.get("text") or "")
+                break
+
+        story_opts = extract_story_options(latest_assistant, max_items=12)
+        focus_labels = ["Whole page"]
+        focus_map: Dict[str, str] = {"Whole page": ""}
+
+        for (lbl, txt) in story_opts:
+            preview = re.sub(r"\s+", " ", txt).strip()
+            preview = (preview[:120] + "…") if len(preview) > 120 else preview
+            key_label = f"{lbl} — {preview}" if preview else lbl
+            # Ensure uniqueness
+            if key_label in focus_map:
+                key_label = f"{key_label} ({len(focus_map)+1})"
+            focus_labels.append(key_label)
+            focus_map[key_label] = txt
+
+        focus_pick = st.selectbox(
+            "Focus follow-ups on",
+            options=focus_labels,
+            index=0,
+            help="Optional: narrow your follow-up question to one item/section from the summary.",
+            key=_wk("oa_focus_pick", thread_key, ui_prefix),
+        )
+        focus_text = focus_map.get(focus_pick, "")
+        with st.form(key=_wk("oa_followup_form", thread_key, ui_prefix), clear_on_submit=True):
             q = st.text_area(
                 "Follow-up question",
                 value="",
                 height=80,
                 placeholder="Ask for more details, names, context…",
-                key=_wk("oa_followup_text", thread_key),
+                key=_wk("oa_followup_text", thread_key, ui_prefix),
             )
             ask = st.form_submit_button("Ask follow-up")
 
+        
         if ask and q.strip():
-            state["messages"].append({"role": "user", "text": q.strip()})
+            user_q = q.strip()
+
+            selected_prompt_mode = str(st.session_state.get(prompt_mode_key, "Summary + Deep dive (default)"))
+            mode_instruction = ""
+            if selected_prompt_mode == "Word-for-word transcription":
+                mode_instruction = (
+                    "Mode: Word-for-word transcription. Do NOT summarize. "
+                    "Preserve wording/spelling/punctuation as printed as best as possible. "
+                    "Use [unclear] where needed."
+                )
+            elif selected_prompt_mode == "Sports only":
+                mode_instruction = "Mode: Sports only. Focus ONLY on sports content; otherwise say none found."
+            elif selected_prompt_mode == "Extract names & roles":
+                mode_instruction = "Mode: Extract names & roles. List people/places/organizations and short roles."
+            elif selected_prompt_mode == "Timeline only":
+                mode_instruction = "Mode: Timeline only. Produce a chronological timeline of dated events mentioned."
+            elif selected_prompt_mode == "Historical analysis":
+                mode_instruction = (
+                    "Mode: Historical analysis. Emphasize context, framing/bias, and why-it-matters; keep factual."
+                )
+            else:
+                mode_instruction = "Mode: Summary + deep dive. Keep responses aligned to the summary + historical relevance."
+
+            send_q = user_q
+            if focus_text:
+                send_q = (
+                    f"{mode_instruction}\n\n"
+                    "Focus ONLY on the following section from the page summary. "
+                    "If the user asks something outside it, say so and stay within the section.\n\n"
+                    f"{focus_text}\n\nUser question: {user_q}"
+                )
+            else:
+                send_q = f"{mode_instruction}\n\nUser question: {user_q}"
+
+            state["messages"].append({"role": "user", "text": user_q})
             with st.spinner("Thinking…"):
-                out, new_id = openai_followup(model=model, question=q, previous_response_id=state["last_response_id"])
+                out, new_id = openai_followup(model=model, question=send_q, previous_response_id=state["last_response_id"])
             if new_id:
                 state["last_response_id"] = new_id
             state["messages"].append({"role": "assistant", "text": out})
@@ -1739,7 +2094,7 @@ def make_overlay_preview(
 # ----------------------------
 # PDF + Summarize panel (USED IN BOTH SEARCH + LIBRARY)
 # ----------------------------
-def render_pdf_panel_for_url(page_url: str, *, title_hint: str = "newspaper_page"):
+def render_pdf_panel_for_url(page_url: str, *, title_hint: str = "newspaper_page", key_prefix: str = ""):
     """Panel for a loc.gov newspaper page URL.
     OCR-first for summarization (cheapest), with PDF fallback only when needed.
     Also allows opening/downloading the PDF (download fetch is on-demand).
@@ -1766,7 +2121,7 @@ def render_pdf_panel_for_url(page_url: str, *, title_hint: str = "newspaper_page
                 file_name=fname,
                 mime="application/pdf",
                 use_container_width=True,
-                key=f"dl_pdf_{hash(meta.final_url or meta.pdf_url or pdf_url)}",
+                key=f"{key_prefix}dl_pdf_{sha256_hex(str(meta.final_url or meta.pdf_url or pdf_url).encode('utf-8'))[:12]}",
             )
             st.caption(f"Downloaded {len(pdf_bytes):,} bytes from: {meta.final_url or meta.pdf_url or pdf_url}")
         else:
@@ -1845,6 +2200,7 @@ def render_pdf_panel_for_url(page_url: str, *, title_hint: str = "newspaper_page
                 source_url=page_url,
                 ocr_text="",
                 pdf_bytes=pdf_bytes,
+                ui_prefix=key_prefix,
             )
 # ----------------------------
 # Save-to-library (Search tab)
@@ -2075,7 +2431,7 @@ def render_library_viewer():
         st.link_button("Open article", url, use_container_width=True)
 
     if url:
-        render_pdf_panel_for_url(url, title_hint=f"{title}_{year or ''}")
+        render_pdf_panel_for_url(url, title_hint=f"{title}_{year or ''}", key_prefix=f"lib_{row_id}_")
 
     if isinstance(tags, list):
         st.write("**Tags:**", ", ".join([str(t) for t in tags]) if tags else "—")
@@ -2303,7 +2659,7 @@ def render_item(item: Dict[str, Any], keyword: str):
         link = item_link(item)
         if link:
             st.link_button("Open item on loc.gov", link, use_container_width=True)
-            render_pdf_panel_for_url(link, title_hint=f"{item_title(item)}_{item_date_str(item)}")
+            render_pdf_panel_for_url(link, title_hint=f"{item_title(item)}_{item_date_str(item)}", key_prefix=f"search_{st.session_state.get('result_index',0)}_")
 
     render_save_to_library(item)
 
@@ -2342,6 +2698,7 @@ def render_search_app():
     st.session_state.setdefault("last_exact_final", [])
     st.session_state.setdefault("last_query_url", "")
     st.session_state.setdefault("last_error", {})
+    st.session_state.setdefault("using_near_matches", False)
 
     apply_params_if_present_once()
     apply_pending_before_widgets()
@@ -2435,6 +2792,12 @@ def render_search_app():
     if not exact_all and not exact:
         st.info("No matches loaded yet. Use the sidebar and click **Search this date** (or **Surprise me**).")
         return
+
+    if bool(st.session_state.get("using_near_matches")):
+        st.warning("No exact month/day matches were found for that year. Showing *near matches* from a wider date window instead.")
+        wide = st.session_state.get("last_query_url_wide")
+        if wide:
+            st.caption("Widened-window query was used to find near matches.")
 
     if keyword:
         if require_keyword:
@@ -2584,6 +2947,7 @@ def render_pdf_summarizer_tab():
             source_url=url,
             ocr_text="",
             pdf_bytes=pdf_bytes,
+                ui_prefix=key_prefix,
         )
         return
 
@@ -2610,6 +2974,7 @@ def render_pdf_summarizer_tab():
             source_url="(uploaded PDF)",
             ocr_text="",
             pdf_bytes=pdf_bytes,
+                ui_prefix=key_prefix,
         )
         return
 
@@ -2656,18 +3021,229 @@ def render_pdf_summarizer_tab():
     )
 
 
+
 # ----------------------------
-# Main
+# This Date in History (Wikipedia "On this day")
 # ----------------------------
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def fetch_onthisday(month: int, day: int) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Fetch "On this day" data for Wikipedia (English) for the given month/day.
+
+    Uses Wikimedia Feed API (preferred) and falls back to RESTBase endpoints if needed.
+
+    Returns: (payload_or_none, debug_dict)
+    """
+    mm = int(month)
+    dd = int(day)
+    mm2 = f"{mm:02d}"
+    dd2 = f"{dd:02d}"
+
+    debug: Dict[str, Any] = {
+        "ok": False,
+        "status": None,
+        "content_type": None,
+        "error": None,
+        "url": None,
+        "snippet": None,
+        "fallback_used": None,
+    }
+
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    headers = {
+        "User-Agent": f"ThisDayInHistoryStreamlit/{APP_VERSION}",
+        "Accept": "application/json",
+    }
+
+    # Preferred: Wikimedia Feed API
+    urls = [
+        f"https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/all/{mm2}/{dd2}",
+        # Fallbacks: RESTBase endpoints (some installations are picky about padding)
+        f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/all/{mm2}/{dd2}",
+    ]
+
+    for u in urls:
+        debug["url"] = u
+        req = urllib.request.Request(u, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                raw = resp.read()
+                debug["status"] = getattr(resp, "status", None)
+                debug["content_type"] = resp.headers.get("Content-Type", "") or ""
+        except urllib.error.HTTPError as e:
+            debug["status"] = e.code
+            debug["error"] = f"HTTPError {e.code}: {e.reason}"
+            try:
+                raw_err = e.read()
+                debug["snippet"] = raw_err[:600].decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            continue
+        except Exception as e:
+            debug["error"] = f"{type(e).__name__}: {e}"
+            continue
+
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+            if isinstance(payload, dict):
+                debug["ok"] = True
+                debug["error"] = None
+                debug["snippet"] = None
+                debug["fallback_used"] = u
+                return payload, debug
+        except Exception as e:
+            debug["error"] = f"JSON parse failed: {e}"
+            debug["snippet"] = raw[:600].decode("utf-8", errors="replace")
+            continue
+
+    # If /all is unavailable, try category endpoints and assemble
+    assembled: Dict[str, Any] = {"events": [], "births": [], "deaths": [], "holidays": []}
+    cat_urls = {
+        "events": f"https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/events/{mm2}/{dd2}",
+        "births": f"https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/births/{mm2}/{dd2}",
+        "deaths": f"https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/deaths/{mm2}/{dd2}",
+        "holidays": f"https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/holidays/{mm2}/{dd2}",
+    }
+    any_ok = False
+    last_error = None
+    for k, u in cat_urls.items():
+        req = urllib.request.Request(u, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                raw = resp.read()
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+            if isinstance(payload, dict) and isinstance(payload.get(k), list):
+                assembled[k] = payload.get(k) or []
+                any_ok = True
+        except Exception as e:
+            last_error = e
+
+    if any_ok:
+        debug["ok"] = True
+        debug["fallback_used"] = "category_endpoints"
+        debug["url"] = "api.wikimedia.org/feed/v1/wikipedia/en/onthisday/<category>/MM/DD"
+        debug["error"] = None
+        return assembled, debug
+
+    debug["error"] = debug["error"] or (f"{type(last_error).__name__}: {last_error}" if last_error else "Unknown error")
+    return None, debug
+
+
+
+def _format_onthisday_item(it: Dict[str, Any]) -> str:
+    year = it.get("year")
+    txt = (it.get("text") or "").strip()
+    pages = it.get("pages") if isinstance(it.get("pages"), list) else []
+    # add 1-2 reference titles (no raw URLs; keep tidy)
+    refs: List[str] = []
+    for p in pages[:2]:
+        if isinstance(p, dict):
+            title = (p.get("title") or "").strip()
+            if title:
+                refs.append(title)
+    ref_txt = f" — _({', '.join(refs)})_" if refs else ""
+    y = f"**{year}** — " if year is not None else ""
+    return f"{y}{txt}{ref_txt}"
+
+
+def render_this_date_in_history_tab():
+    st.subheader("📅 This Date in History")
+    st.caption("Key historical events, births, deaths, and holidays for the selected month/day.")
+
+    # Use a separate widget key to avoid collision with the Search tab's chosen_date widget.
+    # Provide a button to sync back to the main chosen_date via a Streamlit-safe callback.
+    chosen: dt.date = st.session_state.get("chosen_date") or app_today_date()
+
+    def _sync_to_main():
+        # Streamlit-safe: this runs as a callback
+        st.session_state["chosen_date"] = st.session_state.get("history_date_picker", chosen)
+
+    cols = st.columns([1.2, 1])
+    with cols[0]:
+        picked = st.date_input("Date (month/day)", value=chosen, key="history_date_picker", on_change=_sync_to_main)
+    with cols[1]:
+        st.button("Use this date in Search", on_click=_sync_to_main, use_container_width=True)
+
+    month = picked.month
+    day = picked.day
+
+    payload, dbg = fetch_onthisday(month, day)
+    if not payload:
+        st.error("Could not load 'This Date in History' data.")
+        with st.expander("Debug", expanded=False):
+            st.write("URL:", dbg.get("url"))
+            st.write("Status:", dbg.get("status"))
+            st.write("Content-Type:", dbg.get("content_type"))
+            st.write("Error:", dbg.get("error"))
+            if dbg.get("snippet"):
+                st.code(dbg.get("snippet"))
+        return
+
+    # Payload may be "all" format or assembled categories
+    events = payload.get("events") if isinstance(payload.get("events"), list) else []
+    births = payload.get("births") if isinstance(payload.get("births"), list) else []
+    deaths = payload.get("deaths") if isinstance(payload.get("deaths"), list) else []
+    holidays = payload.get("holidays") if isinstance(payload.get("holidays"), list) else []
+
+    def _fmt_item(it: Dict[str, Any]) -> str:
+        # Wikimedia feed items commonly use 'year' + 'text'
+        year = it.get("year")
+        text = it.get("text") or it.get("pages", [{}])[0].get("extract", "")
+        if year is not None:
+            return f"**{year}** — {text}"
+        return str(text or "").strip()
+
+    if holidays:
+        st.markdown("### Holidays & observances")
+        for it in holidays[:12]:
+            if isinstance(it, dict):
+                s = _fmt_item(it)
+                if s:
+                    st.markdown(f"- {s}")
+
+    st.markdown("### Events")
+    if events:
+        for it in events[:20]:
+            if isinstance(it, dict):
+                s = _fmt_item(it)
+                if s:
+                    st.markdown(f"- {s}")
+    else:
+        st.info("No events found for this date.")
+
+    st.markdown("### Births")
+    if births:
+        for it in births[:18]:
+            if isinstance(it, dict):
+                s = _fmt_item(it)
+                if s:
+                    st.markdown(f"- {s}")
+
+    st.markdown("### Deaths")
+    if deaths:
+        for it in deaths[:18]:
+            if isinstance(it, dict):
+                s = _fmt_item(it)
+                if s:
+                    st.markdown(f"- {s}")
+
+    with st.expander("Source/debug", expanded=False):
+        st.caption("Data from Wikimedia 'On this day' feed (English Wikipedia).")
+        st.write("Fetch method:", dbg.get("fallback_used") or "unknown")
+        st.write("URL:", dbg.get("url"))
+
 def main():
     st.set_page_config(page_title="This Day in History — Newspapers", layout="wide")
     st.title("🗞️ This Day in History — Newspapers")
     st.caption(f"App v{APP_VERSION}")
 
-    tab_search, tab_library, tab_pdf = st.tabs(["🗞️ Search", "🔖 My Library", "📄 PDF Summarizer"])
+    tab_search, tab_history, tab_library, tab_pdf = st.tabs(["🗞️ Search", "📅 This Date in History", "🔖 My Library", "📄 PDF Summarizer"])
 
     with tab_search:
         render_search_app()
+
+    with tab_history:
+        render_this_date_in_history_tab()
 
     with tab_library:
         render_library_viewer()
